@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,17 +12,6 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/go-resty/resty/v2"
-)
-
-const (
-	batchSize         = 250
-	redisList         = "PICKER:REGION_CLIENTS_LIST:MSK"
-	redisResult       = "PICKER:TEST"
-	apiEndpoint       = "https://api.mts.ru/ESAUL_REST_API/0.1.2/esaul/dcc/recommendations"
-	maxConcurrentReqs = 10
-	maxRetries        = 3
-	redisHost         = "mailings-01.ticketland.ru:6379"
-	redisDb           = 1
 )
 
 type Item struct {
@@ -49,10 +37,15 @@ type APIResponse struct {
 	} `json:"items"`
 }
 
+var cfg *Config
+
 func main() {
+
+	cfg = NewConfig()
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr: redisHost,
-		DB:   redisDb,
+		Addr: cfg.RedisHost,
+		DB:   cfg.RedisDb,
 	})
 
 	restClient := resty.New()
@@ -60,10 +53,12 @@ func main() {
 	resultCh := make(chan APIResponse)
 	failedCh := make(chan []Item)
 
-	sem := make(chan struct{}, maxConcurrentReqs)
+	sem := make(chan struct{}, cfg.MaxConcurrentReqs)
 	var wg sync.WaitGroup
 
-	go writeResultsToRedis(rdb, resultCh)
+	wroteDone := make(chan bool)
+
+	go writeResultsToRedis(rdb, resultCh, wroteDone)
 
 	items, err := fetchItemsFromRedis(rdb)
 
@@ -72,12 +67,12 @@ func main() {
 	}
 	log.Printf("Fetched %d items from Redis", len(items))
 
-	batches := splitIntoBatches(items, batchSize)
+	batches := splitIntoBatches(items, cfg.BatchSize)
 
 	// Main loop
-	for tries := 0; tries < maxRetries; tries++ {
+	for tries := 0; tries < cfg.MaxRetries; tries++ {
 		if len(batches) == 0 {
-			log.Println("No items left to process. Exiting...")
+			log.Printf("No items left to process. Exiting...")
 			break
 		}
 
@@ -113,17 +108,17 @@ func main() {
 		}
 
 		if len(batches) == 0 {
-			log.Println("All items processed successfully")
+			log.Printf("All items processed successfully")
 			break
-		} else {
-
 		}
 	}
+	close(resultCh)
+	<-wroteDone
 }
 
 func fetchItemsFromRedis(rdb *redis.Client) ([]Item, error) {
 	ctx := context.Background()
-	result, err := rdb.LRange(ctx, redisList, 0, -1).Result()
+	result, err := rdb.LRange(ctx, cfg.RedisList, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -167,18 +162,16 @@ func splitIntoBatches(items []Item, batchSize int) [][]Item {
 }
 
 func postBatchToAPI(restClient *resty.Client, batch []Item) ([]APIResponse, error) {
-	mtsAuthToken := os.Getenv("MTS_AUTH_TOKEN")
-	mtsApiKey := os.Getenv("MTS_API_KEY")
 
 	startTime := time.Now()
 	resp, err := restClient.R().
 		SetHeader("Content-Type", "application/json").
-		SetHeader("Authorization", "Bearer "+mtsAuthToken).
-		SetHeader("apikey", mtsApiKey).
+		SetHeader("Authorization", "Bearer "+cfg.AuthToken).
+		SetHeader("apikey", cfg.ApiKey).
 		SetBody(batch).
-		Post(apiEndpoint)
+		Post(cfg.ApiEndpoint)
 
-	fmt.Println("Time taken to fetch the batch: ", time.Since(startTime))
+	log.Printf("Time taken to fetch the batch: %s", time.Since(startTime))
 
 	if err != nil {
 		return nil, err
@@ -198,23 +191,35 @@ func postBatchToAPI(restClient *resty.Client, batch []Item) ([]APIResponse, erro
 	return processedBatch, nil
 }
 
-func writeResultsToRedis(rdb *redis.Client, resultCh <-chan APIResponse) {
+func writeResultsToRedis(rdb *redis.Client, resultCh <-chan APIResponse, done chan bool) {
 	ctx := context.Background()
 	var recordsWritten int
+	pipeline := rdb.TxPipeline()
+
 	for res := range resultCh {
 		recordsWritten++
-
 		var items []string
 		for _, item := range res.Items {
 			items = append(items, item.CmsObjectID)
 		}
 		itemsStr := strings.Join(items, ", ")
-
-		_, err := rdb.HSet(ctx, redisResult, res.CustomerID, itemsStr).Result()
-		if err != nil {
-			log.Printf("Error storing result into Redis: %v", err)
-			continue
+		pipeline.HSet(ctx, cfg.RedisResult, res.CustomerID, itemsStr)
+		if recordsWritten >= 10000 {
+			panicIfError(pipeline.Exec(ctx))
+			pipeline = rdb.TxPipeline()
+			log.Printf("Wrote %d records to Redis", recordsWritten)
+			recordsWritten = 0
 		}
 	}
+	if recordsWritten > 0 {
+		panicIfError(pipeline.Exec(ctx))
+	}
 	log.Printf("Wrote %d records to Redis", recordsWritten)
+	done <- true
+}
+
+func panicIfError(_ interface{}, err error) {
+	if err != nil {
+		panic(err)
+	}
 }
