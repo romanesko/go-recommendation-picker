@@ -22,6 +22,8 @@ const (
 	apiEndpoint       = "https://api.mts.ru/ESAUL_REST_API/0.1.2/esaul/dcc/recommendations"
 	maxConcurrentReqs = 10
 	maxRetries        = 3
+	redisHost         = "mailings-01.ticketland.ru:6379"
+	redisDb           = 1
 )
 
 type Item struct {
@@ -48,22 +50,16 @@ type APIResponse struct {
 }
 
 func main() {
-	// Initialize Redis client
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "mailings-01.ticketland.ru:6379", // Redis server address
-		Password: "",                               // No password set
-		DB:       1,                                // Use the default DB
+		Addr: redisHost,
+		DB:   redisDb,
 	})
 
-	// Initialize REST client
 	restClient := resty.New()
 
-	// Channel to receive processed batches
 	resultCh := make(chan APIResponse)
-	// Channel to handle failed requests
 	failedCh := make(chan []Item)
 
-	// Semaphore to limit concurrent API requests
 	sem := make(chan struct{}, maxConcurrentReqs)
 	var wg sync.WaitGroup
 
@@ -86,17 +82,17 @@ func main() {
 		}
 
 		for _, batch := range batches {
-			sem <- struct{}{} // Acquire semaphore token
+			sem <- struct{}{} // Acquire semaphore
 			wg.Add(1)
 			go func(batch []Item) {
 				defer func() {
-					<-sem // Release semaphore token
+					<-sem // Release semaphore
 					wg.Done()
 				}()
 
 				if processedBatch, err := postBatchToAPI(restClient, batch); err != nil {
 					log.Printf("Error posting batch to API: %v", err)
-					failedCh <- batch // Put the failed chunk into the failed queue
+					failedCh <- batch
 				} else {
 					for _, res := range processedBatch {
 						resultCh <- res
@@ -147,7 +143,7 @@ func fetchItemsFromRedis(rdb *redis.Client) ([]Item, error) {
 			SiteID:                       "4",
 			AdvertisingInventoryCapacity: 20,
 			GeographicArea:               "msk",
-			CustomerID:                   strconv.Itoa(clientID), // Convert client ID to string
+			CustomerID:                   strconv.Itoa(clientID),
 			RecommendationCD:             "I2P",
 		}
 		items = append(items, item)
@@ -171,8 +167,8 @@ func splitIntoBatches(items []Item, batchSize int) [][]Item {
 }
 
 func postBatchToAPI(restClient *resty.Client, batch []Item) ([]APIResponse, error) {
-	mtsAuthToken := os.Getenv("MTS_AUTH_TOKEN") // Get MTS Auth Token from environment variable
-	mtsApiKey := os.Getenv("MTS_API_KEY")       // Get MTS API Key from environment variable
+	mtsAuthToken := os.Getenv("MTS_AUTH_TOKEN")
+	mtsApiKey := os.Getenv("MTS_API_KEY")
 
 	startTime := time.Now()
 	resp, err := restClient.R().
@@ -192,13 +188,10 @@ func postBatchToAPI(restClient *resty.Client, batch []Item) ([]APIResponse, erro
 		return nil, fmt.Errorf("non-200 status code received: %d", resp.StatusCode())
 	}
 
-	// Try to unmarshal API response into slice of APIResponse structs
 	var processedBatch []APIResponse
 	if err := json.Unmarshal(resp.Body(), &processedBatch); err != nil {
-		// If unmarshaling fails, log the response body as a string
 		log.Printf("Error unmarshaling API response: %v", err)
 		log.Printf("API response body: %s", resp.Body())
-		// Return an error
 		return nil, fmt.Errorf("error unmarshaling API response")
 	}
 
@@ -209,17 +202,14 @@ func writeResultsToRedis(rdb *redis.Client, resultCh <-chan APIResponse) {
 	ctx := context.Background()
 	var recordsWritten int
 	for res := range resultCh {
-		// Increment recordsWritten count
 		recordsWritten++
 
-		// Transform response into desired format
 		var items []string
 		for _, item := range res.Items {
 			items = append(items, item.CmsObjectID)
 		}
 		itemsStr := strings.Join(items, ", ")
 
-		// Store transformed result into Redis hash
 		_, err := rdb.HSet(ctx, redisResult, res.CustomerID, itemsStr).Result()
 		if err != nil {
 			log.Printf("Error storing result into Redis: %v", err)
